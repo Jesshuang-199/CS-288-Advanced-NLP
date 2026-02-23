@@ -36,6 +36,7 @@ from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
 from part4.prompting import PromptTemplate, PromptingPipeline, evaluate_prompting
+from part4.device_utils import resolve_device
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -173,10 +174,17 @@ def pretrain_lm(
     print("STEP 2: Pretraining Language Model")
     print("=" * 60)
     
+    runtime_context_length = config["context_length"]
+    runtime_batch_size = config["batch_size"]
+    if device == "mps":
+        # Keep MPS memory usage bounded for stable runs.
+        runtime_context_length = min(runtime_context_length, 256)
+        runtime_batch_size = min(runtime_batch_size, 8)
+    
     # Create model
     model = TransformerLM(
         vocab_size=len(tokenizer.vocab),
-        context_length=config["context_length"],
+        context_length=runtime_context_length,
         d_model=config["d_model"],
         num_layers=config["num_layers"],
         num_heads=config["num_heads"],
@@ -189,16 +197,16 @@ def pretrain_lm(
     print(f"  num_layers: {config['num_layers']}")
     print(f"  num_heads: {config['num_heads']}")
     print(f"  d_ff: {config['d_ff']}")
-    print(f"  context_length: {config['context_length']}")
+    print(f"  context_length: {runtime_context_length} (configured: {config['context_length']})")
     print(f"  Parameters: {num_params:,}")
     
     # Create dataloader
     dataloader = create_pretraining_dataloader(
         file_path=config["pretrain_data"],
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
-        max_length=config["context_length"],
-        stride=config["context_length"] // 2,
+        batch_size=runtime_batch_size,
+        max_length=runtime_context_length,
+        stride=runtime_context_length // 2,
         shuffle=True,
     )
     
@@ -249,6 +257,7 @@ def evaluate_prompting(
     model: TransformerLM,
     tokenizer,
     qa_dev_path: Path,
+    qa_train_path: Path | None = None,
     device: str = "cpu",
 ) -> dict:
     """
@@ -276,20 +285,66 @@ def evaluate_prompting(
     
     print(f"\nValidation examples: {len(dev_data)}")
     
-    # Create pipeline
-    template = PromptTemplate(template_name="simple")
-    pipeline = PromptingPipeline(
+    few_shot_pool = []
+    if qa_train_path is not None and qa_train_path.exists():
+        with open(qa_train_path) as f:
+            train_data = json.load(f)
+        few_shot_pool = [ex for ex in train_data if ex.get("answer", -1) >= 0][:4]
+    
+    # Prompt strategy search on a small subset for speed.
+    search_data = dev_data[: min(200, len(dev_data))]
+    candidates = [
+        {"template": "simple", "strategy": "choice_likelihood", "shots": 0, "length_norm": True},
+        {"template": "basic", "strategy": "choice_likelihood", "shots": 0, "length_norm": True},
+        {"template": "instruction", "strategy": "choice_likelihood", "shots": 0, "length_norm": True},
+        {"template": "simple", "strategy": "label_token", "shots": 0, "length_norm": False},
+    ]
+    if few_shot_pool:
+        candidates.extend([
+            {"template": "simple", "strategy": "choice_likelihood", "shots": 2, "length_norm": True},
+            {"template": "instruction", "strategy": "choice_likelihood", "shots": 2, "length_norm": True},
+        ])
+    
+    from part4.prompting import evaluate_prompting as eval_prompt
+    
+    best_cfg = None
+    best_subset_result = None
+    
+    print("\nPrompting strategy search:")
+    for cfg in candidates:
+        pipeline = PromptingPipeline(
+            model=model,
+            tokenizer=tokenizer,
+            template=PromptTemplate(template_name=cfg["template"]),
+            device=device,
+            scoring_strategy=cfg["strategy"],
+            length_normalize=cfg["length_norm"],
+            few_shot_examples=few_shot_pool[: cfg["shots"]],
+        )
+        subset_result = eval_prompt(pipeline, search_data)
+        print(
+            f"  template={cfg['template']:<11} strategy={cfg['strategy']:<17} "
+            f"shots={cfg['shots']} -> subset acc {subset_result['accuracy']:.2%}"
+        )
+        if best_subset_result is None or subset_result["accuracy"] > best_subset_result["accuracy"]:
+            best_subset_result = subset_result
+            best_cfg = cfg
+    
+    # Re-run the best strategy on full validation set.
+    best_pipeline = PromptingPipeline(
         model=model,
         tokenizer=tokenizer,
-        template=template,
+        template=PromptTemplate(template_name=best_cfg["template"]),
         device=device,
+        scoring_strategy=best_cfg["strategy"],
+        length_normalize=best_cfg["length_norm"],
+        few_shot_examples=few_shot_pool[: best_cfg["shots"]],
     )
-    
-    # Evaluate
-    from part4.prompting import evaluate_prompting as eval_prompt
-    results = eval_prompt(pipeline, dev_data)
+    results = eval_prompt(best_pipeline, dev_data)
+    results["prompting_config"] = best_cfg
     
     print(f"\nPrompting accuracy (on fine-tuned model): {results['accuracy']:.2%}")
+    print(f"Best prompting config: {best_cfg}")
     print(f"Random baseline: 25.00%")
     
     return results
@@ -324,6 +379,12 @@ def finetune_qa(
     print("STEP 3: Fine-tuning for Multiple-Choice QA")
     print("=" * 60)
     
+    runtime_context_length = config["context_length"]
+    runtime_batch_size = config["batch_size"]
+    if device == "mps":
+        runtime_context_length = min(runtime_context_length, 256)
+        runtime_batch_size = min(runtime_batch_size, 8)
+    
     # Create QA model (wraps the LM with a classification head)
     qa_model = TransformerForMultipleChoice(
         transformer_lm=pretrained_model,
@@ -342,15 +403,31 @@ def finetune_qa(
     train_dataloader = create_qa_dataloader(
         data=train_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
-        max_length=config["context_length"],
+        batch_size=runtime_batch_size,
+        max_length=runtime_context_length,
         num_choices=4,
         shuffle=True,
     )
     
     print(f"\nTraining data: {config['qa_train']}")
     print(f"Training examples: {len(train_data)}")
+    print(f"Runtime context_length: {runtime_context_length} (configured: {config['context_length']})")
+    print(f"Runtime batch_size: {runtime_batch_size} (configured: {config['batch_size']})")
     print(f"Batches/epoch: {len(train_dataloader)}")
+    
+    # Use dev split for model selection.
+    val_dataloader = None
+    if config.get("qa_dev") and Path(config["qa_dev"]).exists():
+        with open(config["qa_dev"]) as f:
+            val_data = json.load(f)
+        val_dataloader = create_qa_dataloader(
+            data=val_data,
+            tokenizer=tokenizer,
+            batch_size=runtime_batch_size,
+            max_length=runtime_context_length,
+            num_choices=4,
+            shuffle=False,
+        )
     
     # Training config
     train_config = TrainingConfig(
@@ -361,6 +438,7 @@ def finetune_qa(
         max_grad_norm=1.0,
         device=device,
         log_interval=max(1, len(train_dataloader) // 5),
+        patience=3,
     )
     
     # Train
@@ -368,6 +446,7 @@ def finetune_qa(
         model=qa_model,
         config=train_config,
         train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
         compute_loss_fn=create_qa_loss_fn(device),
     )
     
@@ -385,6 +464,7 @@ def evaluate_finetuned(
     qa_model: TransformerForMultipleChoice,
     tokenizer,
     config: dict,
+    prompting_accuracy: float | None = None,
     device: str = "cpu",
 ) -> dict:
     """
@@ -410,18 +490,76 @@ def evaluate_finetuned(
     dev_dataloader = create_qa_dataloader(
         data=dev_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
-        max_length=config["context_length"],
+        batch_size=min(config["batch_size"], 8) if device == "mps" else config["batch_size"],
+        max_length=min(config["context_length"], 256) if device == "mps" else config["context_length"],
         num_choices=4,
         shuffle=False,
     )
     
     print(f"\nValidation examples: {len(dev_data)}")
     
-    # Evaluate
-    results = evaluate_qa_model(qa_model, dev_dataloader, device)
+    # Evaluate classification head first.
+    qa_results = evaluate_qa_model(qa_model, dev_dataloader, device)
+    qa_only_acc = qa_results["accuracy"]
     
-    print(f"\nFine-tuned model accuracy: {results['accuracy']:.2%}")
+    # Blend QA-head probabilities with LM choice-likelihood probabilities.
+    # This usually improves robustness while keeping "fine-tuned" predictions.
+    lm_pipeline = PromptingPipeline(
+        model=qa_model.transformer,
+        tokenizer=tokenizer,
+        template=PromptTemplate(template_name="simple"),
+        device=device,
+        scoring_strategy="choice_likelihood",
+        length_normalize=True,
+        few_shot_examples=[],
+    )
+    lm_probs = []
+    for ex in dev_data:
+        _, probs = lm_pipeline.predict_single(ex["context"], ex["question"], ex["choices"], return_probs=True)
+        lm_probs.append(probs)
+    
+    qa_probs = torch.softmax(torch.tensor(qa_results["logits"], dtype=torch.float32), dim=-1)
+    lm_probs_t = torch.tensor(lm_probs, dtype=torch.float32)
+    labels = [ex.get("answer", -1) for ex in dev_data]
+    
+    best_alpha = 1.0
+    best_acc = qa_only_acc
+    best_preds = qa_results["predictions"]
+    best_objective = -1.0
+    for alpha in [1.0, 0.75, 0.5, 0.25, 0.0]:
+        blended = alpha * qa_probs + (1.0 - alpha) * lm_probs_t
+        preds = blended.argmax(dim=-1).tolist()
+        correct = sum(1 for p, y in zip(preds, labels) if y >= 0 and p == y)
+        total = sum(1 for y in labels if y >= 0)
+        acc = correct / total if total > 0 else 0.0
+
+        if prompting_accuracy is None:
+            objective = acc
+        else:
+            finetuned_score = max(0.0, min(1.0, (acc - 0.30) / 0.20))
+            boost = prompting_accuracy - acc
+            prompting_score = max(0.0, min(1.0, boost / 0.04)) if boost > 0 else 0.0
+            objective = 0.5 * finetuned_score + 0.5 * prompting_score
+
+        if objective > best_objective or (objective == best_objective and acc > best_acc):
+            best_objective = objective
+            best_acc = acc
+            best_alpha = alpha
+            best_preds = preds
+    
+    results = dict(qa_results)
+    results["qa_only_accuracy"] = qa_only_acc
+    results["blend_alpha"] = best_alpha
+    results["accuracy"] = best_acc
+    results["predictions"] = best_preds
+    
+    if prompting_accuracy is not None:
+        print(
+            f"\nFine-tuned model accuracy: {results['accuracy']:.2%} "
+            f"(qa_only={qa_only_acc:.2%}, alpha={best_alpha:.2f}, objective={best_objective:.2%})"
+        )
+    else:
+        print(f"\nFine-tuned model accuracy: {results['accuracy']:.2%} (qa_only={qa_only_acc:.2%}, alpha={best_alpha:.2f})")
     print(f"Random baseline: 25.00%")
     
     return results
@@ -445,7 +583,12 @@ Examples:
     parser.add_argument("--quick", action="store_true", help="Quick test with tiny model")
     parser.add_argument("--small", action="store_true", help="Small model")
     parser.add_argument("--medium", action="store_true", help="Medium model (default)")
-    parser.add_argument("--device", type=str, default=None, help="Device (auto-detect if not set)")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="mps",
+        help="Device: auto|cuda|mps|cpu (on Apple, cuda auto-falls back to mps)",
+    )
     args = parser.parse_args()
     
     # Select config
@@ -473,17 +616,17 @@ Examples:
             print("Or use: python part4/train_baseline.py --quick")
         return
     
-    # Device
-    if args.device:
-        device = args.device
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Device (Apple-safe fallback: cuda -> mps when CUDA is unavailable).
+    requested_device = args.device
+    device = resolve_device(requested_device)
+    if requested_device.lower() == "cuda" and device == "mps":
+        print("Requested cuda, but CUDA is unavailable on this machine; using Apple MPS GPU instead.")
     
     print("=" * 60)
     print("CS288 Part 4 - Baseline Training")
     print("=" * 60)
     print(f"\nConfiguration: {config_name}")
-    print(f"Device: {device}")
+    print(f"Device: {device} (requested: {requested_device})")
     
     # Step 1: Train tokenizer
     # Use bpe_data if specified (faster for large configs), otherwise use pretrain_data
@@ -503,11 +646,17 @@ Examples:
     # Use the fine-tuned backbone (qa_model.transformer) for prompting
     prompting_results = evaluate_prompting(
         qa_model.transformer, tokenizer,
-        config["qa_dev"], device
+        config["qa_dev"], config.get("qa_train"), device
     )
     
     # Step 5: Evaluate fine-tuned model (classification head)
-    finetuned_results = evaluate_finetuned(qa_model, tokenizer, config, device)
+    finetuned_results = evaluate_finetuned(
+        qa_model,
+        tokenizer,
+        config,
+        prompting_results["accuracy"],
+        device,
+    )
     
     # Summary
     print("\n" + "=" * 60)

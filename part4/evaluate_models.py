@@ -39,6 +39,7 @@ from part4.sampling import greedy_decode, generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
 from part4.prompting import PromptTemplate, PromptingPipeline, evaluate_prompting
 from part4.trainer import Trainer, TrainingConfig
+from part4.device_utils import resolve_device
 
 # Paths
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -348,6 +349,12 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Use smaller datasets for quick testing")
     parser.add_argument("--full", action="store_true", help="Use full TinyStories + SQuAD (default)")
     parser.add_argument("--skip-tests", action="store_true", help="Skip running pytest")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="mps",
+        help="Device: auto|cuda|mps|cpu (on Apple, cuda auto-falls back to mps)",
+    )
     args = parser.parse_args()
     
     mode = "quick" if args.quick else "full"
@@ -358,8 +365,11 @@ def main():
     print("=" * 60)
     print(f"\nMode: {mode.upper()}")
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    requested_device = args.device
+    device = resolve_device(requested_device)
+    if requested_device.lower() == "cuda" and device == "mps":
+        print("Requested cuda, but CUDA is unavailable on this machine; using Apple MPS GPU instead.")
+    print(f"Device: {device} (requested: {requested_device})")
     
     # Check if datasets exist
     if not config["pretrain_data"].exists():

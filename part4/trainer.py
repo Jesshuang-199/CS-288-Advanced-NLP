@@ -2,6 +2,7 @@
 Training utilities.
 Example submission.
 """
+import copy
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -10,7 +11,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Callable
 from pathlib import Path
-import time
 import sys
 
 _parent = str(Path(__file__).parent.parent)
@@ -18,6 +18,7 @@ if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
 from part3.nn_utils import cross_entropy, gradient_clipping
+from part4.device_utils import resolve_device
 
 
 @dataclass
@@ -31,15 +32,17 @@ class TrainingConfig:
     log_interval: int = 10
     save_interval: int = 500
     checkpoint_dir: Optional[str] = None
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = resolve_device("mps")
     use_amp: bool = False
     patience: Optional[int] = None
 
 
 class Trainer:
     def __init__(self, model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader, val_dataloader: Optional[DataLoader] = None, compute_loss_fn: Optional[Callable] = None):
-        self.model = model.to(config.device)
+        self.device = resolve_device(config.device)
+        self.model = model.to(self.device)
         self.config = config
+        self.config.device = self.device
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.compute_loss_fn = compute_loss_fn or self._default_lm_loss
@@ -93,16 +96,32 @@ class Trainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
     
     def train(self) -> Dict[str, Any]:
+        best_state_dict = None
+        patience_counter = 0
+        
         for epoch in range(self.config.num_epochs):
             train_loss = self.train_epoch()
             self.train_losses.append(train_loss)
             if self.val_dataloader:
                 val_loss = self.evaluate()
                 self.val_losses.append(val_loss)
+                
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    best_state_dict = copy.deepcopy(self.model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if self.config.patience is not None and patience_counter >= self.config.patience:
+                        break
+        
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
         return {"train_losses": self.train_losses, "val_losses": self.val_losses}
 
 
-def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: str = "cuda") -> torch.Tensor:
+def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: str = "mps") -> torch.Tensor:
+    device = resolve_device(device)
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
@@ -110,5 +129,5 @@ def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: st
     return cross_entropy(logits, labels)
 
 
-def create_qa_loss_fn(device: str = "cuda") -> Callable:
+def create_qa_loss_fn(device: str = "mps") -> Callable:
     return lambda batch, model: compute_qa_loss(batch, model, device)

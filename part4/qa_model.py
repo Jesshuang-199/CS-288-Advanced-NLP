@@ -14,6 +14,7 @@ if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
 from part2.model import Linear
+from part4.device_utils import resolve_device
 
 
 class TransformerForMultipleChoice(nn.Module):
@@ -69,15 +70,23 @@ class TransformerForMultipleChoice(nn.Module):
         return self.forward(input_ids, attention_mask).argmax(dim=-1)
 
 
-def evaluate_qa_model(model, dataloader, device: str = "cuda") -> dict:
+def evaluate_qa_model(model, dataloader, device: str = "mps") -> dict:
+    device = resolve_device(device)
     model.eval()
     model.to(device)
-    all_predictions, all_labels = [], []
+    all_predictions, all_labels, all_logits = [], [], []
     with torch.no_grad():
         for batch in dataloader:
-            predictions = model.predict(batch["input_ids"].to(device), batch["attention_mask"].to(device))
+            logits = model(batch["input_ids"].to(device), batch["attention_mask"].to(device))
+            predictions = logits.argmax(dim=-1)
             all_predictions.extend(predictions.cpu().tolist())
             all_labels.extend(batch["labels"].cpu().tolist())
+            all_logits.extend(logits.cpu().tolist())
     correct = sum(1 for p, l in zip(all_predictions, all_labels) if l >= 0 and p == l)
     total = sum(1 for l in all_labels if l >= 0)
-    return {"accuracy": correct / total if total > 0 else 0.0, "predictions": all_predictions, "labels": all_labels}
+    return {
+        "accuracy": correct / total if total > 0 else 0.0,
+        "predictions": all_predictions,
+        "labels": all_labels,
+        "logits": all_logits,
+    }
